@@ -2364,6 +2364,9 @@ impl Target {
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema, Debug, Clone)]
 pub struct Execute {
+    /// Critical jobs can bypass the PC limit and consume no slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bypass_local_limit: bool,
     pub shell: ExecuteShell,
     /// Inline script body. Mutually exclusive with [`script_file`]
     /// and [`script_object`]; exactly one of the three must be set
@@ -5229,6 +5232,7 @@ sql_widgets:
         script_object: Option<&str>,
     ) -> Execute {
         Execute {
+            bypass_local_limit: false,
             shell: ExecuteShell::Powershell,
             script: script.map(str::to_owned),
             script_file: script_file.map(str::to_owned),

@@ -1,6 +1,7 @@
 mod check_cache;
 mod collect;
 mod commands;
+mod concurrency;
 mod config_supervisor;
 mod env_gate;
 mod finalize;
@@ -633,6 +634,7 @@ pub(crate) async fn run_agent() -> Result<()> {
     // supervisor publishes the resolved EffectiveConfig on a watch
     // channel; heartbeat / inventory / self_update subscribe.
     let cfg_rx = config_supervisor::spawn(client.clone(), pc_id.clone(), staleness_tracker.clone());
+    concurrency::watch_config(cfg_rx.clone());
 
     // #1165: one verifier shared by every command entry point, so the
     // transition reporting reflects the machine rather than one subscription.

@@ -264,6 +264,7 @@ pub async fn execute(client: async_nats::Client, args: RunArgs) -> Result<()> {
         script_object: None,
         script_object_sha256: None,
         timeout_secs: args.timeout,
+        bypass_local_limit: false,
         jitter_secs: None,
         // Operator-selectable via `--run-as` (defaults to system,
         // the historical behaviour). cwd customisation still

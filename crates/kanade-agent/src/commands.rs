@@ -331,6 +331,86 @@ pub enum CommandSource {
     LocalScheduler,
 }
 
+/// Apply every gate whose answer can change while a command waits. Calling
+/// this both before jitter/admission and after admission preserves fail-fast
+/// skips while preventing a queued command from running on a stale decision.
+async fn command_is_gated(
+    client: &async_nats::Client,
+    pc_id: &str,
+    cmd: &Command,
+    script_current: Option<&Store>,
+    script_status: Option<&Store>,
+    staleness: &Tracker,
+    source: CommandSource,
+) -> Result<bool> {
+    // Spec §2.6 Layer 2: staleness comes first because a stale broker view
+    // makes the KV answers below misleading.
+    match staleness_decide(&cmd.staleness, staleness.staleness(client)) {
+        StalenessDecision::Proceed => {}
+        StalenessDecision::Skip { observed, allowed } => {
+            warn!(
+                cmd_id = %cmd.id,
+                request_id = %cmd.request_id,
+                observed_s = observed.as_secs(),
+                allowed_s = allowed.as_secs(),
+                "skip: staleness policy (mode=strict) exceeded — broker view too old",
+            );
+            publish_staleness_skipped(pc_id, cmd, observed, allowed).await?;
+            return Ok(true);
+        }
+    }
+
+    // Only broker-delivered commands can carry a stale version pin. Local
+    // scheduler commands were built from the authoritative local snapshot.
+    if source == CommandSource::Nats
+        && let Some(cur) = script_current
+        && let Ok(Some(entry)) = cur.get(&cmd.id).await
+    {
+        let expected = String::from_utf8_lossy(&entry).to_string();
+        if version_pin_rejects(source, Some(&expected), &cmd.version) {
+            warn!(
+                cmd_id = %cmd.id,
+                expected = %expected,
+                got = %cmd.version,
+                request_id = %cmd.request_id,
+                "skip stale command (version mismatch)",
+            );
+            publish_version_mismatch_skipped(pc_id, cmd, &expected).await?;
+            return Ok(true);
+        }
+    }
+
+    if let Some(sta) = script_status
+        && let Ok(Some(entry)) = sta.get(&cmd.id).await
+        && String::from_utf8_lossy(&entry) == SCRIPT_STATUS_REVOKED
+    {
+        warn!(
+            cmd_id = %cmd.id,
+            request_id = %cmd.request_id,
+            "skip revoked command",
+        );
+        publish_revoked_skipped(pc_id, cmd).await?;
+        return Ok(true);
+    }
+
+    let now = chrono::Utc::now();
+    if let Some(deadline) = cmd.deadline_at
+        && should_skip_for_deadline(deadline, now)
+    {
+        warn!(
+            cmd_id = %cmd.id,
+            request_id = %cmd.request_id,
+            %deadline,
+            %now,
+            "skip: starting deadline expired",
+        );
+        publish_skipped(client, pc_id, cmd, deadline, now).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_command(
     client: async_nats::Client,
@@ -343,92 +423,82 @@ pub async fn handle_command(
     check_sink: crate::check_cache::CheckSink,
     source: CommandSource,
 ) -> Result<CommandOutcome> {
-    // Spec §2.6 Layer 2: version-pinning + revoke check + v0.26
-    // staleness policy. The order matters:
-    //   1. staleness gate first — if the policy is `strict` and the
-    //      agent's broker view is too old, refuse to run before
-    //      consulting any KV (because a stale KV read would be
-    //      misleading). `cached` / `unchecked` flow straight through.
-    //   2. version-pin + revoke checks (unchanged from v0.22.1).
-    let staleness_now = staleness.staleness(&client);
-    match staleness_decide(&cmd.staleness, staleness_now) {
-        StalenessDecision::Proceed => {}
-        StalenessDecision::Skip { observed, allowed } => {
-            warn!(
-                cmd_id = %cmd.id,
-                request_id = %cmd.request_id,
-                observed_s = observed.as_secs(),
-                allowed_s = allowed.as_secs(),
-                "skip: staleness policy (mode=strict) exceeded — broker view too old",
-            );
-            publish_staleness_skipped(&pc_id, &cmd, observed, allowed).await?;
-            return Ok(CommandOutcome::Skipped);
-        }
+    if command_is_gated(
+        &client,
+        &pc_id,
+        &cmd,
+        script_current.as_ref(),
+        script_status.as_ref(),
+        &staleness,
+        source,
+    )
+    .await?
+    {
+        return Ok(CommandOutcome::Skipped);
     }
 
-    // Version-pin gate (§2.6.4): only NATS-delivered commands can carry a
-    // stale broker-queued version. An agent-local fire builds cmd.version
-    // from the same authoritative BUCKET_JOBS snapshot, so gating it
-    // against the backend-only `script_current` KV would self-reject every
-    // `runs_on: agent` tick after a bump (exit 124). See [`CommandSource`].
-    if source == CommandSource::Nats
-        && let Some(cur) = &script_current
-        && let Ok(Some(entry)) = cur.get(&cmd.id).await
-    {
-        let expected = String::from_utf8_lossy(&entry).to_string();
-        if version_pin_rejects(source, Some(&expected), &cmd.version) {
-            warn!(
-                cmd_id = %cmd.id,
-                expected = %expected,
-                got = %cmd.version,
-                request_id = %cmd.request_id,
-                "skip stale command (version mismatch)",
-            );
-            // #271: publish a synthetic skipped-result so the
-            // `executions` row this command belongs to transitions
-            // out of `pending` rather than rotting forever and
-            // inflating the /api/jobs `実行中` counter. Same shape
-            // as the Layer 1 staleness / deadline-expired skips.
-            publish_version_mismatch_skipped(&pc_id, &cmd, &expected).await?;
-            return Ok(CommandOutcome::Skipped);
-        }
-    }
-    if let Some(sta) = &script_status
-        && let Ok(Some(entry)) = sta.get(&cmd.id).await
-    {
-        let status = String::from_utf8_lossy(&entry).to_string();
-        if status == SCRIPT_STATUS_REVOKED {
-            warn!(
-                cmd_id = %cmd.id,
-                request_id = %cmd.request_id,
-                "skip revoked command",
-            );
-            // #271: same fix as the version-mismatch path — emit a
-            // synthetic result so the executions row can reach
-            // `completed` instead of stranding `pending`.
-            publish_revoked_skipped(&pc_id, &cmd).await?;
-            return Ok(CommandOutcome::Skipped);
-        }
-    }
+    // Jitter BEFORE we log "executing command" and stamp `started_at`,
+    // so the log line, the recorded duration (`finished_at -
+    // started_at`), and the events.started lifecycle event all reflect
+    // the real execution start — not the per-PC fleet-stagger wait. It
+    // previously sat inside `run_command_with_kill`, i.e. after the
+    // timestamp, so a 5-min jitter inflated the dashboard 所要時間 well
+    // past the job's `timeout:` even though the script itself finished
+    // in seconds (the timeout arm only ever bounded the post-jitter
+    // execution), and "executing command" logged minutes before
+    // anything ran. apply_jitter emits its own "applying jitter" line,
+    // so the wait is still visible in the logs. The "実行中" view
+    // likewise no longer lights up during the jitter wait.
+    apply_jitter(&cmd).await;
 
-    // v0.22: deadline_at gates "missed deadline" commands. When the
-    // scheduler stamps a deadline and the agent receives the Command
-    // after that absolute time (offline reconnect, broker queueing,
-    // etc.), publish a synthetic skipped-result so the operator sees
-    // the outcome on the Results page rather than silence.
-    let now = chrono::Utc::now();
-    if let Some(deadline) = cmd.deadline_at {
-        if should_skip_for_deadline(deadline, now) {
-            warn!(
-                cmd_id = %cmd.id,
-                request_id = %cmd.request_id,
-                %deadline,
-                %now,
-                "skip: starting deadline expired",
+    let _local_slot = match crate::concurrency::admit(&client, &cmd).await {
+        Ok(permit) => permit,
+        Err(outcome) => {
+            let now = chrono::Utc::now();
+            let (exit_code, stderr) = match outcome {
+                ExecOutcome::Completed {
+                    exit_code, stderr, ..
+                } => (exit_code, stderr),
+                ExecOutcome::Killed { stderr, .. } => (-1, stderr),
+                ExecOutcome::Timeout { stderr, .. } => (-1, stderr),
+            };
+            enqueue_result_best_effort(
+                ExecResult {
+                    result_id: Uuid::new_v4().to_string(),
+                    request_id: cmd.request_id.clone(),
+                    exec_id: cmd.exec_id.clone(),
+                    parent_result_id: None,
+                    pc_id: pc_id.clone(),
+                    exit_code,
+                    stdout: String::new(),
+                    stderr,
+                    started_at: now,
+                    finished_at: now,
+                    stdout_object: None,
+                    stderr_object: None,
+                    manifest_id: Some(cmd.id.clone()),
+                    collect_object: None,
+                },
+                "local admission cancellation enqueued",
             );
-            publish_skipped(&client, &pc_id, &cmd, deadline, now).await?;
             return Ok(CommandOutcome::Skipped);
         }
+    };
+
+    // Recheck after jitter/admission: a queued job may have been revoked,
+    // superseded or expired while waiting.
+    if command_is_gated(
+        &client,
+        &pc_id,
+        &cmd,
+        script_current.as_ref(),
+        script_status.as_ref(),
+        &staleness,
+        source,
+    )
+    .await?
+    {
+        return Ok(CommandOutcome::Skipped);
     }
 
     // #210: resolve OBJECT_SCRIPTS-backed scripts just in time.
@@ -473,20 +543,6 @@ pub async fn handle_command(
             }
         }
     }
-
-    // Jitter BEFORE we log "executing command" and stamp `started_at`,
-    // so the log line, the recorded duration (`finished_at -
-    // started_at`), and the events.started lifecycle event all reflect
-    // the real execution start — not the per-PC fleet-stagger wait. It
-    // previously sat inside `run_command_with_kill`, i.e. after the
-    // timestamp, so a 5-min jitter inflated the dashboard 所要時間 well
-    // past the job's `timeout:` even though the script itself finished
-    // in seconds (the timeout arm only ever bounded the post-jitter
-    // execution), and "executing command" logged minutes before
-    // anything ran. apply_jitter emits its own "applying jitter" line,
-    // so the wait is still visible in the logs. The "実行中" view
-    // likewise no longer lights up during the jitter wait.
-    apply_jitter(&cmd).await;
 
     info!(
         cmd_id = %cmd.id,

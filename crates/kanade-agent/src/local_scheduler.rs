@@ -110,10 +110,13 @@ struct State {
     /// later ticks start while the first is still sleeping in jitter —
     /// all seeing the same stale `completions`. The value is a
     /// self-healing deadline (`claim time + jitter + timeout + slack`):
-    /// if a run dies/hangs past it (e.g. the agent was killed
-    /// mid-run), the next tick reclaims instead of staying stuck until
-    /// agent restart. Not persisted — a fresh process starts empty.
+    /// after a task dies past it, the next tick can reclaim the mark.
+    /// A living task (including one queued for a slot) is protected by
+    /// `live_fires` even beyond this deadline. Not persisted.
     in_flight: HashMap<String, DateTime<Utc>>,
+    /// A living task may wait for a local slot beyond its historical TTL.
+    /// Weak ownership prevents a cancelled/panicked task from wedging dedup.
+    live_fires: HashMap<String, std::sync::Weak<()>>,
     /// Last-known fleet change-freeze (#418 Phase 5), kept fresh by
     /// [`spawn_freeze_watch_task`] (a `fleet_config` KV watcher) — NOT
     /// re-read per tick (gemini #472). Cached here so a freeze set
@@ -156,9 +159,8 @@ impl State {
     /// first's `in_flight` entry.
     ///
     /// `claim_ttl` is the longest a legitimate run can take
-    /// (`jitter + timeout + slack`); past it the previous claim is
-    /// presumed dead and reclaimed so the schedule self-heals without
-    /// an agent restart.
+    /// (`jitter + timeout + slack`) without queueing. Past it, a claim
+    /// whose task is no longer alive is reclaimed without a restart.
     fn try_claim_fire(
         &mut self,
         schedule_id: &str,
@@ -168,6 +170,13 @@ impl State {
         now: DateTime<Utc>,
         claim_ttl: ChronoDuration,
     ) -> (bool, bool) {
+        if self
+            .live_fires
+            .get(schedule_id)
+            .is_some_and(|task| task.strong_count() > 0)
+        {
+            return (false, false);
+        }
         let should = match mode {
             // Event triggers fire on each occurrence — the OS event
             // source already decided "now" (boot / logon). Per-occurrence
@@ -223,6 +232,7 @@ impl State {
     ) {
         if self.in_flight.get(schedule_id) == Some(&deadline) {
             self.in_flight.remove(schedule_id);
+            self.live_fires.remove(schedule_id);
         }
         if let Some(when) = success_at {
             self.record_completion(schedule_id, job_id, when);
@@ -233,10 +243,16 @@ impl State {
     /// schedule? A cheap early short-circuit (claude #463 review) so a
     /// concurrent tick blocked by an in-flight run skips before
     /// building the Command and hitting KV. TTL-aware on purpose: a
-    /// *stale* (past-deadline) entry returns false so the tick falls
-    /// through to `try_claim_fire`, which reclaims it (self-heal). A
-    /// plain `contains_key` would defeat that.
+    /// stale entry with no living task falls through to `try_claim_fire`
+    /// for reclamation. Queueing can legitimately outlast the TTL.
     fn is_live_in_flight(&self, schedule_id: &str, now: DateTime<Utc>) -> bool {
+        if self
+            .live_fires
+            .get(schedule_id)
+            .is_some_and(|task| task.strong_count() > 0)
+        {
+            return true;
+        }
         self.in_flight
             .get(schedule_id)
             .is_some_and(|&deadline| now < deadline)
@@ -427,6 +443,7 @@ async fn run(
         startup_markers,
         startup_markers_path,
         in_flight: HashMap::new(),
+        live_fires: HashMap::new(),
         freeze: None,
     }));
 
@@ -1187,6 +1204,7 @@ async fn unregister_locally(internal: &JobScheduler, state: &Arc<Mutex<State>>, 
         // from before an *edit* should still guard the re-registered
         // schedule's first tick.)
         st.in_flight.remove(schedule_id);
+        st.live_fires.remove(schedule_id);
         st.registered.remove(schedule_id)
     };
     if let Some(uuid) = uuid_opt {
@@ -1588,6 +1606,22 @@ fn spawn_network_change_watcher() {
     }
 }
 
+/// Anchor local admission to this fire, so jitter and slot waits cannot extend
+/// a configured starting deadline. Invalid or overflowing durations fail closed.
+fn local_starting_deadline(
+    raw: Option<&str>,
+    fired_at: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
+    raw.map(|raw| {
+        let duration = humantime::parse_duration(raw).context("parse starting_deadline")?;
+        let duration = ChronoDuration::from_std(duration).context("starting_deadline overflow")?;
+        fired_at
+            .checked_add_signed(duration)
+            .context("starting_deadline timestamp overflow")
+    })
+    .transpose()
+}
+
 async fn local_tick(
     client: &async_nats::Client,
     pc_id: &str,
@@ -1774,8 +1808,8 @@ async fn local_tick(
     }
 
     // 3) Build a Command in-process (no NATS hop) and call
-    //    handle_command directly. Skip the deadline (= None) since
-    //    we just fired this very instant — no delivery lag.
+    //    handle_command directly. Include the starting deadline because
+    //    jitter and local admission can delay the actual execution.
     //
     // #210 / Gemini #214 HIGH: build the Command in the same shape
     // backend's exec.rs would — inline body for `script:` manifests,
@@ -1821,12 +1855,20 @@ async fn local_tick(
         .as_deref()
         .and_then(|s| humantime::parse_duration(s).ok())
         .map(|d| d.as_secs());
+    let deadline_at = match local_starting_deadline(schedule.starting_deadline.as_deref(), now) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            warn!(schedule_id = %schedule.id, %error, "local_scheduler: invalid starting deadline — skip");
+            return;
+        }
+    };
     let exec_id = Uuid::new_v4().to_string();
     let cmd = Command {
         id: manifest.id.clone(),
         version: manifest.version.clone(),
         request_id: Uuid::new_v4().to_string(),
         exec_id: Some(exec_id),
+        bypass_local_limit: manifest.execute.bypass_local_limit,
         shell: manifest.execute.shell.into(),
         script: script_body,
         script_object: script_object_ref.as_ref().map(|(k, _)| k.clone()),
@@ -1835,7 +1877,7 @@ async fn local_tick(
         jitter_secs,
         run_as: manifest.execute.run_as,
         cwd: manifest.execute.cwd.clone(),
-        deadline_at: None,
+        deadline_at,
         // v0.26: forward the Manifest's Layer 2 staleness policy so
         // `handle_command` evaluates it against the agent's current
         // broker-connectivity reading at fire time.
@@ -1900,16 +1942,22 @@ async fn local_tick(
     // still holds this token, so a late finish from an overrun run
     // can't clear a reclaimer's mark (gemini #463 review).
     let deadline = now + claim_ttl;
+    let live_fire = Arc::new(());
     let (claimed, reclaimed_stale) = {
         let mut st = state.lock().await;
-        st.try_claim_fire(
+        let claim = st.try_claim_fire(
             &schedule.id,
             &manifest.id,
             lowered.mode,
             cooldown,
             now,
             claim_ttl,
-        )
+        );
+        if claim.0 {
+            st.live_fires
+                .insert(schedule.id.clone(), Arc::downgrade(&live_fire));
+        }
+        claim
     };
     if !claimed {
         debug!(
@@ -2020,6 +2068,49 @@ mod tests {
     const T: u64 = STARTUP_BOOT_THRESHOLD_SECS; // 120
 
     #[test]
+    fn local_deadline_is_anchored_to_the_fire_and_rejects_invalid_values() {
+        assert_eq!(local_starting_deadline(None, t(100)).unwrap(), None);
+        assert_eq!(
+            local_starting_deadline(Some("30s"), t(100)).unwrap(),
+            Some(t(130)),
+        );
+        assert!(local_starting_deadline(Some("invalid"), t(100)).is_err());
+        assert!(local_starting_deadline(Some("1s"), DateTime::<Utc>::MAX_UTC).is_err());
+    }
+
+    #[test]
+    fn a_queued_task_stays_in_flight_past_the_old_ttl() {
+        let mut st = test_state();
+        let task = Arc::new(());
+        st.in_flight.insert("queued".into(), t(1));
+        st.live_fires.insert("queued".into(), Arc::downgrade(&task));
+        assert!(st.is_live_in_flight("queued", t(120)));
+        assert_eq!(
+            st.try_claim_fire(
+                "queued",
+                "job",
+                ExecMode::EveryTick,
+                None,
+                t(120),
+                ChronoDuration::seconds(60)
+            ),
+            (false, false)
+        );
+        drop(task);
+        assert!(!st.is_live_in_flight("queued", t(120)));
+        assert_eq!(
+            st.try_claim_fire(
+                "queued",
+                "job",
+                ExecMode::EveryTick,
+                None,
+                t(120),
+                ChronoDuration::seconds(60)
+            ),
+            (true, true)
+        );
+    }
+    #[test]
     fn startup_fires_when_never_recorded() {
         // No marker → first time on this host → fire.
         assert!(should_fire_startup(None, 1_000_000, 5, None));
@@ -2108,6 +2199,7 @@ mod tests {
             startup_markers: HashMap::new(),
             startup_markers_path: sp,
             in_flight: HashMap::new(),
+            live_fires: HashMap::new(),
             freeze: None,
         }
     }

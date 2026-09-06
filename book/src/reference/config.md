@@ -34,6 +34,62 @@ file = "target/dev-data/agent/logs/agent.log"
 
 ---
 
+### Per-PC job concurrency
+
+`max_local_concurrent` lives in the layered `agent_config` store, not the
+agent TOML file. It applies to backend schedules, agent-local schedules,
+and operator runs from the CLI or administration SPA. One agent shares a
+single budget across these paths. **User-triggered kanade-client actions
+are exempt**: they start without waiting for or consuming a slot. They do
+not interrupt jobs already running.
+
+When no scope sets the limit, the agent uses its locally available logical
+CPU count (falling back to 1 if detection fails). The backend leaves this
+automatic value as `null`; it never substitutes the backend host's CPU count.
+An explicit limit must be an integer of at least 1. Scopes apply in order:
+built-in automatic default → global → groups → PC.
+
+```sh
+kanade config set max_local_concurrent=4
+kanade config set --group low-power max_local_concurrent=2
+kanade config set --pc EXACT-HOSTNAME max_local_concurrent=1
+kanade config unset --pc EXACT-HOSTNAME max_local_concurrent
+```
+
+`unset` restores inheritance; when all applicable scopes omit the field,
+CPU-based sizing resumes. Updates apply without restarting the agent.
+Reducing the limit lets existing jobs finish and holds new jobs until enough
+slots are free. A job keeps its slot through retries, collection and finalize.
+Jitter happens before admission. Queued jobs can be killed and are skipped if
+their starting deadline expires. Waiting does not
+consume the script timeout or emit a running lifecycle event. Execution gates
+(version pin, revocation, staleness and deadline) are checked before jitter
+and again after admission.
+
+Compatibility note: `runs_on: agent` schedules previously omitted their
+starting deadline from local commands. They now enforce `starting_deadline`
+from the local fire time, including jitter and slot waiting. Existing schedules
+whose jitter exceeds that deadline can therefore report a deadline skip even
+with a free slot. Keep the deadline longer than the maximum jitter plus the
+acceptable queue wait, or omit it when late execution is acceptable.
+Kill delivery is best effort: if the broker subscription fails, the agent logs
+a warning and continues waiting under the same capacity and deadline rules.
+
+A critical job can opt out for every execution of that manifest:
+
+```yaml
+execute:
+  shell: powershell
+  script: 'Write-Output "critical action"'
+  timeout: 30s
+  bypass_local_limit: true
+```
+
+Exempt jobs consume no slots, so total host concurrency can exceed the limit.
+The budget is agent-process-wide; it assumes one agent service per PC.
+`constraints.max_concurrent` remains a separate backend, fleet-wide per-job
+limit. This setting does not fix its jitter accounting issue (#1373).
+
 ## 2. Backend Configuration
 
 The backend coordination layer retrieves its configurations from the file specified by `KANADE_BACKEND_CONFIG` or registers default structures.

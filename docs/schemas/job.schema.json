@@ -831,6 +831,10 @@
     "Execute": {
       "type": "object",
       "properties": {
+        "bypass_local_limit": {
+          "description": "Critical jobs can bypass the PC limit and consume no slot.",
+          "type": "boolean"
+        },
         "cwd": {
           "description": "Working directory for the spawned child (v0.21.1). When\nunset, the child inherits the agent's cwd — on Windows that\nmeans `%SystemRoot%\\System32` for the prod service, which is\nalmost never what operators actually want. Use an absolute\npath; relative paths are passed through to the OS verbatim.\n`%PROGRAMDATA%` works for `run_as: system`; for `run_as: user`\nyou'd want `%USERPROFILE%` (but expansion happens in the\nshell, so write `$env:USERPROFILE` for PowerShell, or set\nit via teravars before `kanade job create`).",
           "type": [

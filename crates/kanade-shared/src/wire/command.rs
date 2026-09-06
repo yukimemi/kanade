@@ -6,6 +6,8 @@ use crate::manifest::{CheckHint, CollectHint, EmitConfig};
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema, Debug, Clone)]
 pub struct Command {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bypass_local_limit: bool,
     pub id: String,
     pub version: String,
     pub request_id: String,
@@ -238,6 +240,7 @@ mod tests {
             script_object: None,
             script_object_sha256: None,
             timeout_secs: 30,
+            bypass_local_limit: false,
             jitter_secs: Some(5),
             run_as: RunAs::System,
             cwd: None,

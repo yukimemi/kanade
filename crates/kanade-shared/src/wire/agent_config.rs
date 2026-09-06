@@ -47,6 +47,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct ConfigScope {
+    /// Maximum simultaneous non-Client jobs on each PC.
+    /// Unset uses the agent CPU count; zero is invalid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_local_concurrent: Option<std::num::NonZeroU32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_version: Option<String>,
     /// Random sleep window applied at each agent before it starts
@@ -104,7 +108,8 @@ pub struct ConfigScope {
 
 impl ConfigScope {
     pub fn is_empty(&self) -> bool {
-        self.target_version.is_none()
+        self.max_local_concurrent.is_none()
+            && self.target_version.is_none()
             && self.target_version_jitter.is_none()
             && self.heartbeat_interval.is_none()
             && self.host_perf_interval.is_none()
@@ -123,6 +128,9 @@ impl ConfigScope {
 /// when no scope sets them.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveConfig {
+    /// None means automatic sizing on the endpoint, never on the backend.
+    #[serde(default)]
+    pub max_local_concurrent: Option<std::num::NonZeroU32>,
     pub target_version: Option<String>,
     pub target_version_jitter: String,
     pub heartbeat_interval: String,
@@ -145,6 +153,7 @@ impl EffectiveConfig {
     /// Floor values used when no KV scope sets a given field.
     pub fn builtin_defaults() -> Self {
         Self {
+            max_local_concurrent: None,
             target_version: None,
             // #491: safe-by-default. The pre-Sprint-11 "0s" default
             // meant a fleet-wide target_version flip made every
@@ -283,6 +292,12 @@ pub fn resolve(
         let Some(scope) = group_scopes.get(*g) else {
             continue;
         };
+        if scope.max_local_concurrent.is_some() {
+            setters
+                .entry("max_local_concurrent")
+                .or_default()
+                .push(g.to_string());
+        }
         if scope.target_version.is_some() {
             setters
                 .entry("target_version")
@@ -353,6 +368,9 @@ pub fn resolve(
 }
 
 fn apply_scope(out: &mut EffectiveConfig, s: &ConfigScope) {
+    if let Some(v) = s.max_local_concurrent {
+        out.max_local_concurrent = Some(v);
+    }
     if let Some(v) = &s.target_version {
         out.target_version = Some(v.clone());
     }
@@ -383,6 +401,18 @@ fn apply_scope(out: &mut EffectiveConfig, s: &ConfigScope) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn local_limit_inherits_and_rejects_zero() {
+        let global: ConfigScope = serde_json::from_str(r#"{"max_local_concurrent":4}"#).unwrap();
+        let pc: ConfigScope = serde_json::from_str(r#"{"max_local_concurrent":2}"#).unwrap();
+        assert!(!pc.is_empty());
+        assert!(serde_json::from_str::<ConfigScope>(r#"{"max_local_concurrent":0}"#).is_err());
+        let (inherited, _) = resolve(Some(&global), &BTreeMap::new(), None, &[]);
+        assert_eq!(inherited.max_local_concurrent.unwrap().get(), 4);
+        let (overridden, _) = resolve(Some(&global), &BTreeMap::new(), Some(&pc), &[]);
+        assert_eq!(overridden.max_local_concurrent.unwrap().get(), 2);
+        assert!(EffectiveConfig::default().max_local_concurrent.is_none());
+    }
     fn scope() -> ConfigScope {
         ConfigScope::default()
     }

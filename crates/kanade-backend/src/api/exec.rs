@@ -173,6 +173,7 @@ pub async fn exec_manifest(
         version: manifest.version.clone(),
         request_id: Uuid::new_v4().to_string(),
         exec_id: Some(exec_id.clone()),
+        bypass_local_limit: manifest.execute.bypass_local_limit,
         shell: manifest.execute.shell.into(),
         script: inline_script.clone(),
         script_object: script_object_ref.as_ref().map(|(k, _)| k.clone()),
