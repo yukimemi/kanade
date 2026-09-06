@@ -50,12 +50,14 @@ import { useAuth } from '@/lib/auth';
 // `{ every: <humantime> }`) or a calendar time trigger (Phase 2:
 // `{ at, days }`, repeating or one-shot). Mirrors the
 // externally-tagged Rust enum's JSON.
-type WhenPolicy = 'once' | { every: string };
+type WhenPolicy = 'once' | 'once_per_version' | { every: string };
 type CalendarSpec = { at: string; days?: string[] };
-type WhenSpec =
+type OnTrigger = 'startup' | 'logon' | 'lock' | 'unlock' | 'network_change';
+export type WhenSpec =
   | { per_pc: WhenPolicy }
   | { per_target: WhenPolicy }
-  | { calendar: CalendarSpec };
+  | { calendar: CalendarSpec }
+  | { on: OnTrigger[] };
 
 type ScheduleRow = {
   id: string;
@@ -171,10 +173,11 @@ function summariseTarget(target: ScheduleRow['target'], allLabel: string): strin
 // (`per_pc once` / `per_pc every 6h` / `at 09:00 [mon-fri]` /
 // `at 2026-06-10 09:00`) so logs, audit payloads and the SPA all
 // read identically.
-function summariseWhen(when: WhenSpec): string {
-  const policy = (p: WhenPolicy) => (p === 'once' ? 'once' : `every ${p.every}`);
+export function summariseWhen(when: WhenSpec): string {
+  const policy = (p: WhenPolicy) => (typeof p === 'string' ? p : `every ${p.every}`);
   if ('per_pc' in when) return `per_pc ${policy(when.per_pc)}`;
   if ('per_target' in when) return `per_target ${policy(when.per_target)}`;
+  if ('on' in when) return `on [${when.on.join(',')}]`;
   const c = when.calendar;
   return c.days?.length ? `at ${c.at} [${c.days.join(',')}]` : `at ${c.at}`;
 }
