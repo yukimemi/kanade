@@ -587,6 +587,9 @@ pub fn build_command(
         request_id: request_id.to_string(),
         // run_id == exec_id: the kill subject the run subscribes to.
         exec_id: Some(run_id.to_string()),
+        // KLP Client runs bypass admission by choosing the direct run_job
+        // path below, regardless of the manifest's automation setting.
+        bypass_local_limit: false,
         shell: manifest.execute.shell.into(),
         script,
         script_object: None,
@@ -636,6 +639,8 @@ async fn run_job(
     push_tx: mpsc::Sender<Vec<u8>>,
     pc_id: String,
 ) {
+    // Client actions are interactive: start immediately without acquiring or
+    // consuming a local slot, even when scheduled/admin jobs fill the budget.
     push_progress(
         &push_tx,
         JobProgress {
@@ -1178,6 +1183,7 @@ mod tests {
             version: "1.0.0".into(),
             description: None,
             execute: Execute {
+                bypass_local_limit: false,
                 shell: ExecuteShell::Powershell,
                 script: Some("echo hi".into()),
                 script_file: None,

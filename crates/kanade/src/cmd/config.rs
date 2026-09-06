@@ -246,6 +246,12 @@ fn apply_field(scope: &mut ConfigScope, field: &str, value: Option<&str>) -> Res
         }
     };
     match field {
+        "max_local_concurrent" => {
+            scope.max_local_concurrent = value
+                .map(str::parse::<std::num::NonZeroU32>)
+                .transpose()
+                .context("max_local_concurrent: expected an integer >= 1")?;
+        }
         "target_version" => scope.target_version = value.map(String::from),
         "target_version_jitter" => {
             scope.target_version_jitter = parsed_duration(field, value)?;
@@ -287,7 +293,7 @@ fn apply_field(scope: &mut ConfigScope, field: &str, value: Option<&str>) -> Res
         // The agent/client trim + treat blank as "unset" downstream.
         "client_display_name" => scope.client_display_name = value.map(String::from),
         other => bail!(
-            "unknown field '{other}' — supported: target_version, target_version_jitter, heartbeat_interval, host_perf_interval, process_perf_enabled, process_perf_expires_at, process_perf_top_n, client_display_name"
+            "unknown field '{other}' — supported: max_local_concurrent, target_version, target_version_jitter, heartbeat_interval, host_perf_interval, process_perf_enabled, process_perf_expires_at, process_perf_top_n, client_display_name"
         ),
     }
     Ok(())
@@ -297,6 +303,17 @@ fn apply_field(scope: &mut ConfigScope, field: &str, value: Option<&str>) -> Res
 mod tests {
     use super::*;
 
+    #[test]
+    fn local_limit_sets_clears_and_rejects_invalid_values() {
+        let mut s = ConfigScope::default();
+        apply_field(&mut s, "max_local_concurrent", Some("2")).unwrap();
+        assert_eq!(s.max_local_concurrent.unwrap().get(), 2);
+        for value in ["0", "-1", "1.5", "4294967296"] {
+            assert!(apply_field(&mut s, "max_local_concurrent", Some(value)).is_err());
+        }
+        apply_field(&mut s, "max_local_concurrent", None).unwrap();
+        assert!(s.max_local_concurrent.is_none());
+    }
     #[test]
     fn apply_field_sets_string() {
         let mut s = ConfigScope::default();

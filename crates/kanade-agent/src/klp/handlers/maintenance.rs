@@ -355,6 +355,7 @@ mod tests {
             version: "1.0.0".into(),
             description: None,
             execute: Execute {
+                bypass_local_limit: false,
                 shell: ExecuteShell::Powershell,
                 script: Some("echo hi".into()),
                 script_file: None,

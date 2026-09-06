@@ -97,6 +97,7 @@ pub async fn run(
         script_object: None,
         script_object_sha256: None,
         timeout_secs: req.timeout_secs,
+        bypass_local_limit: false,
         jitter_secs: req.jitter_secs,
         // Operator-selectable since the SPA Run page grew a run_as
         // picker; defaults to System (the inherited agent identity,
