@@ -16,6 +16,7 @@ mod web;
 #[cfg(target_os = "windows")]
 mod service;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -30,6 +31,106 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+/// Spawn a background projector task that retries with capped
+/// exponential backoff on failure instead of permanently exiting.
+///
+/// Issue #1442: every projector previously did `if let Err(e) =
+/// X::run(...).await { error!(...); }` inside a bare `tokio::spawn` —
+/// a single startup failure (e.g. a JetStream consumer that can't be
+/// created because the broker's own consumer metadata is corrupted)
+/// permanently killed that projector for the rest of the process's
+/// lifetime, with no retry and no restart. For the results projector
+/// specifically this meant zero ExecResults were ever ingested again
+/// until the next binary restart — silently, since the only symptom
+/// was a slow buildup of reaped executions elsewhere.
+///
+/// `%e` (anyhow's `Display`) also only prints the top-level `.context()`
+/// message, not the underlying cause — logging `{e:#}` instead surfaces
+/// the full chain (e.g. the actual JetStream/NATS error), which is what
+/// made this failure mode take manual JetStream API probing to diagnose
+/// instead of being visible from the log alone.
+///
+/// `make` is called again on every retry so each attempt gets fresh
+/// clones of whatever handles the projector needs (JetStream context,
+/// pool, caches, ...) — a projector's `run` future is not reusable.
+///
+/// PR #1443 review: `run` returning `Ok(())` is NOT treated as a clean
+/// shutdown — every supervised projector's `run` is a `while let
+/// Some(msg) = messages.next().await { ... }` loop with no other
+/// return path, so `Ok(())` only happens when the underlying
+/// subscription/consumer stream itself ends (e.g. broker restart,
+/// consumer deleted out from under it). Breaking out of the retry
+/// loop there would silently reproduce this issue's exact failure
+/// mode, just triggered by a stream end instead of a create error.
+/// So both arms retry; only the log level and backoff-reset
+/// eligibility differ.
+fn spawn_retrying_projector<F, Fut>(name: &'static str, mut make: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+    // A run that stays up at least this long before failing again is
+    // treated as a fresh problem rather than continued instability —
+    // otherwise a projector that flakes for a few minutes at broker
+    // boot (ratcheting backoff up towards MAX_BACKOFF) and then runs
+    // cleanly for weeks would inherit that elevated backoff on its
+    // next, unrelated failure instead of retrying quickly.
+    const STABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+    tokio::spawn(async move {
+        let mut backoff = INITIAL_BACKOFF;
+        loop {
+            let started = std::time::Instant::now();
+            match make().await {
+                Ok(()) => warn!(
+                    projector = name,
+                    retry_in_secs = backoff.as_secs(),
+                    "projector stream ended — reconnecting",
+                ),
+                Err(e) => error!(
+                    error = %format!("{e:#}"),
+                    projector = name,
+                    retry_in_secs = backoff.as_secs(),
+                    "projector exited — retrying",
+                ),
+            }
+            if started.elapsed() >= STABLE_AFTER {
+                backoff = INITIAL_BACKOFF;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = next_backoff(backoff, MAX_BACKOFF);
+        }
+    });
+}
+
+/// Doubling backoff with a hard cap. Mirrors
+/// `kanade_agent::nats_retry::next_backoff`'s shape (same doubling +
+/// cap contract, no jitter here since this backs off a single
+/// long-lived background task rather than a fleet of agents that
+/// could otherwise hit the broker in lockstep).
+fn next_backoff(current: std::time::Duration, cap: std::time::Duration) -> std::time::Duration {
+    current.saturating_mul(2).min(cap)
+}
+
+#[cfg(test)]
+mod spawn_retrying_projector_tests {
+    use super::next_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn next_backoff_doubles_then_caps() {
+        let cap = Duration::from_secs(60);
+        let mut backoff = Duration::from_secs(1);
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            backoff = next_backoff(backoff, cap);
+            seen.push(backoff.as_secs());
+        }
+        assert_eq!(seen, vec![2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -1159,28 +1260,22 @@ pub(crate) async fn run_backend() -> Result<()> {
         let js = jetstream.clone();
         let cache = explode_spec_cache.clone();
         let mailer = mailer.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::results::run(js, pool, cache, mailer).await {
-                error!(error = %e, "results projector exited");
-            }
+        spawn_retrying_projector("results", move || {
+            projector::results::run(js.clone(), pool.clone(), cache.clone(), mailer.clone())
         });
     }
     {
         let pool = pool.clone();
         let js = jetstream.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::audit::run(js, pool).await {
-                error!(error = %e, "audit projector exited");
-            }
+        spawn_retrying_projector("audit", move || {
+            projector::audit::run(js.clone(), pool.clone())
         });
     }
     {
         let pool = pool.clone();
         let nats_client = nats.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::heartbeat::run(nats_client, pool).await {
-                error!(error = %e, "heartbeat projector exited");
-            }
+        spawn_retrying_projector("heartbeat", move || {
+            projector::heartbeat::run(nats_client.clone(), pool.clone())
         });
     }
     // v0.40 Part 1: host-wide perf time-series projector. Same core-
@@ -1190,10 +1285,8 @@ pub(crate) async fn run_backend() -> Result<()> {
     {
         let pool = pool.clone();
         let nats_client = nats.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::host_perf::run(nats_client, pool).await {
-                error!(error = %e, "host_perf projector exited");
-            }
+        spawn_retrying_projector("host_perf", move || {
+            projector::host_perf::run(nats_client.clone(), pool.clone())
         });
     }
     // v0.41 / Phase 2: per-process perf time-series projector. Only
@@ -1204,10 +1297,8 @@ pub(crate) async fn run_backend() -> Result<()> {
     {
         let pool = pool.clone();
         let nats_client = nats.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::process_perf::run(nats_client, pool).await {
-                error!(error = %e, "process_perf projector exited");
-            }
+        spawn_retrying_projector("process_perf", move || {
+            projector::process_perf::run(nats_client.clone(), pool.clone())
         });
     }
     // v0.30 / PR α' unified: project agent `events.started.*.*` into
@@ -1222,10 +1313,8 @@ pub(crate) async fn run_backend() -> Result<()> {
         // per-run reap deadline from the cached manifest's timeout, so
         // it shares the same ExplodeSpecCache as the results projector.
         let cache = explode_spec_cache.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::events::run(js, pool, cache).await {
-                error!(error = %e, "events projector exited");
-            }
+        spawn_retrying_projector("events", move || {
+            projector::events::run(js.clone(), pool.clone(), cache.clone())
         });
     }
     // Issue #246: per-PC observability timeline. Distinct from the
@@ -1235,10 +1324,8 @@ pub(crate) async fn run_backend() -> Result<()> {
     {
         let pool = pool.clone();
         let js = jetstream.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::obs_events::run(js, pool).await {
-                error!(error = %e, "obs_events projector exited");
-            }
+        spawn_retrying_projector("obs_events", move || {
+            projector::obs_events::run(js.clone(), pool.clone())
         });
     }
     // Phase E (KLP notifications): project
@@ -1248,10 +1335,8 @@ pub(crate) async fn run_backend() -> Result<()> {
     {
         let pool = pool.clone();
         let js = jetstream.clone();
-        tokio::spawn(async move {
-            if let Err(e) = projector::notifications::run(js, pool).await {
-                error!(error = %e, "notification-acks projector exited");
-            }
+        spawn_retrying_projector("notification-acks", move || {
+            projector::notifications::run(js.clone(), pool.clone())
         });
     }
     // v0.30 follow-up: periodic housekeeping that flips long-stale
