@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.45.15"
+version      = "0.45.16"
 edition      = "2024"
 rust-version = "1.85"
 license      = "MIT"
@@ -32,7 +32,7 @@ categories   = ["command-line-utilities", "network-programming"]
 # from a release PR touches one place instead of three. Each consumer
 # crate uses `kanade-shared.workspace = true` and inherits the path
 # + version from this single declaration.
-kanade-shared      = { path = "crates/kanade-shared", version = "0.45.15" }
+kanade-shared      = { path = "crates/kanade-shared", version = "0.45.16" }
 
 tokio              = { version = "1.53.1", features = ["full"] }
 async-nats         = "0.50.0"
